@@ -1,126 +1,140 @@
 import VSync.Checksum
+import VSync.Sha256
 import Std.Data.HashMap
 
 /-!
-# rsync delta algorithm
+# rsync delta algorithm (hardened)
 
-* `signature old B` — weak + strong checksum of every full `B`-byte block of `old`.
-* `delta sig new`   — scan `new` with a rolling weak checksum; on a weak hit,
-  confirm with the strong hash and emit `copy i`, otherwise emit a literal byte.
-* `patch old B ops` — rebuild the file from `old` and the ops.
-
-Main theorem `patch_delta`: if the strong hash has no collisions against the
-blocks of `old` (the assumption real rsync also makes), then
-`patch old B (delta (signature old B) new) = new`.
+* `signature old B` — for every full `B`-byte block of `old`: weak rolling checksum and
+  SHA-256. Indexed by weak checksum (cheap filter) and by (weak, SHA-256) (exact lookup),
+  so a position costs O(1) map lookups however many duplicate blocks `old` has.
+* `delta sig confirm new` — scan `new` with the rolling weak checksum; on a hit, look up
+  (weak, SHA-256) and take the first candidate block that `confirm` accepts.
+  - `confirmLocal old B` compares the bytes: correctness is **unconditional**.
+  - `confirmRemote` trusts SHA-256 (the sender doesn't have `old`).
+  Consecutive literal bytes are emitted as one `lits` op.
+* `patch old B ops` — rebuild the file.
 -/
 
 namespace VSync
 
-/-! ## Strong hash: 64-bit FNV-1a. Not cryptographic; the proof is generic in it. -/
+/-! ## Blocks and ops -/
 
-def fnvStep (h : UInt64) (b : UInt8) : UInt64 := (h ^^^ b.toUInt64) * 0x100000001b3
-def strong (w : List UInt8) : UInt64 := w.foldl fnvStep 0xcbf29ce484222325
+def strong (w : ByteArray) : ByteArray := sha256 w
 
-/-! ## Spec helpers -/
-
-/-- Block `i` of `old` (the spec view). -/
-def block (old : Array UInt8) (B i : Nat) : List UInt8 := (old.toList.drop (i * B)).take B
+/-- Block `i` of `old`. -/
+def block (old : ByteArray) (B i : Nat) : ByteArray := old.extract (i * B) (i * B + B)
 
 inductive Op where
   | copy (i : Nat)
-  | lit (b : UInt8)
-  deriving Repr, BEq, Inhabited
+  | lits (bytes : ByteArray)
+  deriving Inhabited
+
+def Op.bytes (old : ByteArray) (B : Nat) : Op → List UInt8
+  | .copy i => (block old B i).data.toList
+  | .lits b => b.data.toList
 
 def Op.isCopy : Op → Bool
   | .copy _ => true
-  | .lit _ => false
+  | .lits _ => false
+
+def Op.litLen : Op → Nat
+  | .copy _ => 0
+  | .lits b => b.size
 
 def numCopies (ops : Array Op) : Nat := ops.toList.countP Op.isCopy
-def numLits (ops : Array Op) : Nat := ops.toList.countP (! ·.isCopy)
-
-def Op.bytes (old : Array UInt8) (B : Nat) : Op → List UInt8
-  | .copy i => block old B i
-  | .lit b => [b]
+def litBytes (ops : Array Op) : Nat := (ops.toList.map Op.litLen).sum
 
 /-! ## Signature -/
 
+structure Key where
+  w : Weak
+  d : ByteArray
+  deriving DecidableEq, Hashable
+
 structure Sig where
   B : Nat
-  strongs : Array UInt64
-  index : Std.HashMap Weak (List Nat)
+  strongs : Array ByteArray
+  weaks : Std.HashMap Weak Unit
+  index : Std.HashMap Key (List Nat)
 
 /-- Prepend block index `i` to a candidate list. -/
 def consIdx (i : Nat) : Option (List Nat) → Option (List Nat)
   | none => some [i]
   | some l => some (i :: l)
 
-def addBlock (old : Array UInt8) (B i : Nat) (m : Std.HashMap Weak (List Nat)) :
-    Std.HashMap Weak (List Nat) :=
-  m.alter (weakAt old (i * B) B) (consIdx i)
+def addBlock (old : ByteArray) (B i : Nat) (m : Std.HashMap Key (List Nat)) :
+    Std.HashMap Key (List Nat) :=
+  m.alter ⟨weakAt old (i * B) B, strong (block old B i)⟩ (consIdx i)
 
-def signature (old : Array UInt8) (B : Nat) : Sig :=
-  let n := if B = 0 then 0 else old.size / B
-  let strongs := (Array.range n).map fun i => strong (old.extract (i * B) (i * B + B)).toList
-  let index := (List.range n).foldr (addBlock old B) {}
-  { B, strongs, index }
+def addWeak (old : ByteArray) (B i : Nat) (m : Std.HashMap Weak Unit) : Std.HashMap Weak Unit :=
+  m.insert (weakAt old (i * B) B) ()
+
+def numBlocks (old : ByteArray) (B : Nat) : Nat := if B = 0 then 0 else old.size / B
+
+def signature (old : ByteArray) (B : Nat) : Sig :=
+  let n := numBlocks old B
+  { B
+    strongs := (Array.range n).map fun i => strong (block old B i)
+    weaks := (List.range n).foldr (addWeak old B) {}
+    index := (List.range n).foldr (addBlock old B) {} }
+
+/-! ## Match confirmation -/
+
+/-- Local mode: confirm a candidate by comparing bytes with the real block. -/
+def confirmLocal (old : ByteArray) (B : Nat) (i : Nat) (win : ByteArray) : Bool :=
+  decide (win = block old B i)
+
+/-- Remote mode: the sender has only the signature, so it trusts SHA-256. -/
+def confirmRemote (_ : Nat) (_ : ByteArray) : Bool := true
 
 /-! ## Delta -/
 
-def pushLit (acc : Array Op) (b : UInt8) : Array Op := acc.push (.lit b)
-
-def pick (strongs : Array UInt64) (h : UInt64) : List Nat → Option Nat
+def pick (sig : Sig) (confirm : Nat → ByteArray → Bool) (win d : ByteArray) :
+    List Nat → Option Nat
   | [] => none
-  | i :: is => if strongs[i]? == some h then some i else pick strongs h is
+  | i :: is => if sig.strongs[i]? = some d ∧ confirm i win = true then some i
+               else pick sig confirm win d is
 
-theorem pick_spec {s : Array UInt64} {h : UInt64} :
-    ∀ {l : List Nat} {i : Nat}, pick s h l = some i → s[i]? = some h
-  | [], _, hp => by simp [pick] at hp
-  | j :: js, i, hp => by
-    unfold pick at hp
-    split at hp
-    · rename_i hb; cases hp; simpa using hb
-    · exact pick_spec hp
+def findMatch (sig : Sig) (confirm : Nat → ByteArray → Bool) (w : Weak) (win : ByteArray) :
+    Option Nat :=
+  if sig.weaks.contains w then
+    match sig.index[(⟨w, strong win⟩ : Key)]? with
+    | none => none
+    | some l => pick sig confirm win (strong win) l
+  else none
 
-def findMatch (sig : Sig) (w : Weak) (win : List UInt8) : Option Nat :=
-  match sig.index[w]? with
-  | none => none
-  | some cands => pick sig.strongs (strong win) cands
+/-- Emit the pending literal run `new[s, p)`, if non-empty. -/
+def flush (new : ByteArray) (s p : Nat) (acc : Array Op) : Array Op :=
+  if s < p then acc.push (.lits (new.extract s p)) else acc
 
-theorem findMatch_spec {sig : Sig} {w win i} (h : findMatch sig w win = some i) :
-    sig.strongs[i]? = some (strong win) := by
-  unfold findMatch at h
-  split at h
-  · cases h
-  · exact pick_spec h
-
-/-- Main scan loop. `w` is the rolling checksum of the window at `p`
-(correctness of the output does not depend on it; only match-finding does). -/
-def go (sig : Sig) (hB : 0 < sig.B) (new : Array UInt8) (p : Nat) (w : Weak)
-    (acc : Array Op) : Array Op :=
+/-- Main scan loop. `s` = start of the pending literal run, `p` = window position,
+`w` = rolling weak checksum of the window (affects only which matches are found). -/
+def go (sig : Sig) (confirm : Nat → ByteArray → Bool) (hB : 0 < sig.B) (new : ByteArray)
+    (s p : Nat) (w : Weak) (acc : Array Op) : Array Op :=
   if hp : p + sig.B ≤ new.size then
-    let win := (new.extract p (p + sig.B)).toList
-    match findMatch sig w win with
+    match findMatch sig confirm w (new.extract p (p + sig.B)) with
     | some i =>
-      let p' := p + sig.B
-      go sig hB new p' (weakAt new p' sig.B) (acc.push (.copy i))
+      go sig confirm hB new (p + sig.B) (p + sig.B) (weakAt new (p + sig.B) sig.B)
+        ((flush new s p acc).push (.copy i))
     | none =>
       let w' := if h : p + sig.B < new.size then roll sig.B w new[p] new[p + sig.B] else w
-      go sig hB new (p + 1) w' (acc.push (.lit new[p]))
+      go sig confirm hB new s (p + 1) w' acc
   else
-    (new.extract p new.size).foldl pushLit acc
+    flush new s new.size acc
 termination_by new.size - p
 
-def delta (sig : Sig) (new : Array UInt8) : Array Op :=
-  if hB : 0 < sig.B then go sig hB new 0 (weakAt new 0 sig.B) #[]
-  else new.foldl pushLit #[]
+def delta (sig : Sig) (confirm : Nat → ByteArray → Bool) (new : ByteArray) : Array Op :=
+  if hB : 0 < sig.B then go sig confirm hB new 0 0 (weakAt new 0 sig.B) #[]
+  else flush new 0 new.size #[]
 
 /-! ## Patch -/
 
-def patchStep (old : Array UInt8) (B : Nat) (acc : Array UInt8) : Op → Array UInt8
-  | .copy i => acc ++ old.extract (i * B) (i * B + B)
-  | .lit b => acc.push b
+def patchStep (old : ByteArray) (B : Nat) (acc : ByteArray) : Op → ByteArray
+  | .copy i => acc ++ block old B i
+  | .lits b => acc ++ b
 
-def patch (old : Array UInt8) (B : Nat) (ops : Array Op) : Array UInt8 :=
-  ops.foldl (patchStep old B) #[]
+def patch (old : ByteArray) (B : Nat) (ops : Array Op) : ByteArray :=
+  ops.foldl (patchStep old B) ByteArray.empty
 
 end VSync

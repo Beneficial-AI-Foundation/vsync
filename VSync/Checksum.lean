@@ -64,8 +64,33 @@ theorem roll_correct (x y : UInt8) (r : List UInt8) :
 
 /-! ## Implementation over arrays -/
 
+/-- Single pass: `a` accumulates the sum, `b` accumulates the prefix sums. -/
+def wgo (a b : Nat) : List UInt8 → Nat × Nat
+  | [] => (a, b)
+  | x :: r => wgo (a + x.toNat) (b + a + x.toNat) r
+
+theorem wgo_spec : ∀ (l : List UInt8) (a b : Nat),
+    wgo a b l = (a + sumA l, b + l.length * a + sumB l)
+  | [], a, b => by simp [wgo, sumA, sumB]
+  | x :: r, a, b => by
+    simp only [wgo, wgo_spec r, sumA, sumB, List.length_cons, Prod.mk.injEq]
+    constructor
+    · omega
+    · rw [Nat.add_mul, Nat.mul_add, Nat.one_mul, Nat.add_mul, Nat.one_mul]; omega
+
+/-- O(n) weak checksum; `weakFast_eq` proves it equals the spec `weak`. -/
+def weakFast (l : List UInt8) : Weak :=
+  let r := wgo 0 0 l
+  ⟨r.1 % M, r.2 % M⟩
+
+theorem weakFast_eq (l : List UInt8) : weakFast l = weak l := by
+  simp [weakFast, weak, wgo_spec]
+
 /-- Weak checksum of `data[p, p+n)`, computed directly. -/
-def weakAt (data : Array UInt8) (p n : Nat) : Weak :=
-  weak (data.extract p (p + n)).toList
+def weakAt (data : ByteArray) (p n : Nat) : Weak :=
+  weakFast (data.extract p (p + n)).data.toList
+
+theorem weakAt_eq (data : ByteArray) (p n : Nat) :
+    weakAt data p n = weak (data.extract p (p + n)).data.toList := weakFast_eq _
 
 end VSync

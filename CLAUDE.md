@@ -4,7 +4,12 @@
 - Source of truth is this directory; `./vd.sh push|build|pull|all` rsyncs it to `VD:~/vsync`,
   runs `lake build VSync +Main` there (Lean 4.36.0, no Mathlib — VD has 3 GB RAM), and pulls the
   generated C into `./c/`. VD cannot compile C (glibc too old for Lean's clang).
-- `./build-local.sh` compiles `./c/` with the local leanc into `build-local/vsync`.
+- `./build-local.sh` compiles `./c/` with the local leanc (plus `native/vsync_io.c` with the system
+  `cc`, because leanc's clang has no system headers on macOS) into `build-local/vsync`.
+- A plain `lake build` (lakefile.lean) also works on any machine with a C compiler.
+- `native/vsync_io.c` is the only unverified C: keep it tiny (atomic durable write only).
+- Runtime code must stay tied to specs: if you add a fast version of a spec function
+  (e.g. `weakFast` vs `weak`), prove they are equal and add that as a spec.
 
 ## Specs, not tests
 - There are no runtime unit tests. `VSync/Spec.lean` is the test suite: every behaviour is a
