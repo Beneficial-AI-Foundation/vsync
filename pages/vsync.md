@@ -22,6 +22,31 @@
 }
 ```
 
+## What is proven, in plain words
+
+Every line below is a theorem that Lean checks on every build. The ★ rows are the ones that matter most.
+
+| | Guarantee | In plain words |
+|---|---|---|
+| ★ | `sync_local_exact` | A local sync always produces an exact copy of the source, for any files and any block size, **with no assumptions**. |
+| ★ | `sync_remote_roundtrip` | A sync over the network produces an exact copy, assuming SHA-256 has no collisions. |
+| ★ | `wire_roundtrip` | Every network message decodes back to exactly what was sent. The decoder never reads past the bytes it received and never trusts a length it can't check. This is the class of rsync's worst 2025 bug. |
+| ★ | `path_safe` | No path the receiver accepts can contain `..`, `.`, empty parts, `/` or NUL, so a sender can't climb out of the destination folder. |
+| | `sync_segments`, `receiver_streaming` | Streaming (8 MiB pieces, old data read from disk on demand) gives the same result as doing it all in memory. |
+| | `copies_in_range` | The sender only ever asks to reuse blocks that really exist in the old file. |
+| | `receiver_checks_segment` | The receiver never writes data whose SHA-256 differs from what the sender announced. |
+| | `wire_signature` | The block checksums reach the other machine unchanged. |
+| | `sync_self`, `sync_empty_src`, `no_copies_without_blocks` | Unchanged files reuse every full block; empty and missing files are handled correctly. |
+| | `rolling_checksum`, `weak_fast_correct` | The fast checksums the program runs equal their simple reference definitions. |
+| | `skip_only_if_same`, `no_skip_when_racy` | A file is skipped only if size, permissions and mtime match, and never if it changed in the last 2 seconds. |
+| | `sha256_*`, `cli_*` | SHA-256 test vectors and command-line parsing. |
+
+**Weaker than they sound.** SHA-256 is checked on 3 official test inputs, not proven correct in general. The skip and command-line guarantees are true but simple.
+
+**Not proven.** The server loop that calls these functions, about 310 lines of C that read and write files, and the compilers and operating system. In short: *the decisions are proven; the file and process plumbing is tested.*
+
+**Try it yourself.** Delete the `..` check in `safeRel` and run `lake build`: the build refuses to finish, because `path_safe` no longer holds.
+
 ## The main theorem
 
 ```latex
