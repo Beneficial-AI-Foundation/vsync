@@ -1,0 +1,10 @@
+name = "vsync"
+version = "0.1.0"
+defaultTargets = ["vsync"]
+
+[[lean_lib]]
+name = "VSync"
+
+[[lean_exe]]
+name = "vsync"
+root = "Main"
