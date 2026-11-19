@@ -1,5 +1,6 @@
 import VSync.Proofs
 import VSync.Cli
+import VSync.Proto
 
 /-!
 # vsync specification
@@ -109,13 +110,23 @@ theorem sha256_two_blocks :
 theorem cli_block_pos (args : List String) (s d : String) (n : Nat)
     (h : parseArgs args = some (.sync s d (some n))) : 0 < n := by
   unfold parseArgs at h
-  split at h <;> try simp at h
-  rename_i b
   split at h
-  · split at h
-    · simp at h
-    · simp at h; omega
   · simp at h
+  · rename_i b
+    split at h
+    · split at h
+      · simp at h
+      · simp at h; omega
+    · simp at h
+  · obtain ⟨r, b, k, hc⟩ := parsePushOpts_push _ _ _ _ _ _ _ h
+    cases hc
+  · simp at h
+  · simp at h
+
+theorem cli_serve (root : String) : parseArgs ["serve", root] = some (.serve root) := rfl
+
+theorem cli_push_default (s d : String) :
+    parseArgs ["push", s, d] = some (.push s d "ssh" "vsync" false) := rfl
 
 theorem cli_no_args : parseArgs [] = none := rfl
 
@@ -123,6 +134,74 @@ theorem cli_sync_default (s d : String) : parseArgs ["sync", s, d] = some (.sync
 
 theorem cli_default_block_bounds (n : Nat) : 700 ≤ defaultBlock n ∧ defaultBlock n ≤ 131072 := by
   unfold defaultBlock; omega
+
+
+/-! ## 9. Wire format (the class of bug behind rsync's CVE-2024-12084) -/
+
+/-- Every protocol message decodes back to itself. The decoder is a total function with
+bounds-checked reads; lengths from the peer are checked against the bytes actually received. -/
+theorem wire_roundtrip (m : Msg) (h : msgC.valid m) : decodeMsg (encodeMsg m) = some m :=
+  decodeMsg_encodeMsg m h
+
+/-- The signature survives the trip to the sender, and the sender's lookup structure built
+from it is exactly `signature old B`. -/
+theorem wire_signature (old : ByteArray) (B : Nat) (h : sigC.valid (sigData old B)) :
+    (Wire.decodeAll sigC (sigC.enc (sigData old B))).map Sig.build = some (signature old B) := by
+  rw [Wire.decodeAll_enc sigC _ h]; rfl
+
+/-! ## 10. Path safety (the class of bug behind rsync's CVE-2024-12087) -/
+
+/-- An accepted path is a list of plain names: no empty component, no `.`, no `..`,
+no `/` and no NUL inside a component. The receiver therefore cannot be steered outside
+its root by the path itself (symlinks are refused separately, by the kernel, via O_NOFOLLOW). -/
+theorem path_safe (p : ByteArray) (cs : List (List UInt8)) (h : safeRel p = some cs) :
+    ∀ c ∈ cs, c ≠ [] ∧ c ≠ [46] ∧ c ≠ [46, 46] ∧ (0 : UInt8) ∉ c ∧ (47 : UInt8) ∉ c :=
+  safeRel_sound h
+
+theorem path_rejects_parent : safeRel "../etc/passwd".toUTF8 = none := by decide +kernel
+theorem path_rejects_inner_parent : safeRel "a/../../b".toUTF8 = none := by decide +kernel
+theorem path_rejects_absolute : safeRel "/etc/passwd".toUTF8 = none := by decide +kernel
+theorem path_rejects_dot : safeRel "a/./b".toUTF8 = none := by decide +kernel
+theorem path_rejects_empty : safeRel "a//b".toUTF8 = none := by decide +kernel
+theorem path_accepts_plain : (safeRel "docs/a.txt".toUTF8).isSome = true := by decide +kernel
+
+/-! ## 11. Streaming -/
+
+/-- The sender works on one segment at a time; syncing segment by segment reproduces each
+segment exactly, so the concatenation is the whole file. -/
+theorem sync_segments (old : ByteArray) (B : Nat) (segs : List ByteArray) :
+    segs.map (fun s => patch old B (delta (signature old B) (confirmLocal old B) s)) = segs := by
+  conv => rhs; rw [← List.map_id segs]
+  apply List.map_congr_left
+  intro s _
+  exact sync_local_exact old s B
+
+/-- The streaming receiver reads old blocks on demand (`pread`) instead of holding the old
+file in memory. If those reads return the real blocks, its output equals `patch`. -/
+theorem receiver_streaming (old seg : ByteArray) (B : Nat) (get : Nat → ByteArray)
+    (hget : ∀ i < numBlocks old B, get i = block old B i) (hNC : NoCollision old seg B) :
+    patchWith get (delta (signature old B) confirmRemote seg).toList = seg := by
+  rw [patchWith_eq old B get hget _ (delta_valid old seg B confirmRemote)]
+  exact sync_remote_roundtrip old seg B hNC
+
+/-- The receiver never writes a segment whose SHA-256 differs from the sender's. -/
+theorem receiver_checks_segment (out sha x : ByteArray) (h : acceptSeg out sha = some x) :
+    x = out ∧ sha256 x = sha :=
+  acceptSeg_sound h
+
+/-! ## 12. Quick check (skipping unchanged files) -/
+
+/-- A file is skipped only when the sender allowed it and size, permissions and mtime
+(nanoseconds) all match. -/
+theorem skip_only_if_same (allowed : Bool) (a b c d e f : Nat)
+    (h : quickSkip allowed a b c d e f = true) : allowed = true ∧ a = d ∧ b = e ∧ c = f :=
+  quickSkip_sound h
+
+/-- The sender never allows skipping with `--checksum`, nor for a file modified in the last
+two seconds (whose mtime could still collide with an older version's). -/
+theorem no_skip_when_racy (chk : Bool) (m now : Nat) (h : maySkip chk m now = true) :
+    chk = false ∧ m + racyWindowNs ≤ now :=
+  maySkip_not_racy h
 
 /-! ## Axiom audit — add every new spec here -/
 
@@ -170,5 +249,53 @@ theorem cli_default_block_bounds (n : Nat) : 700 ≤ defaultBlock n ∧ defaultB
 
 /-- info: 'VSync.Spec.cli_default_block_bounds' depends on axioms: [propext, Classical.choice, Quot.sound] -/
 #guard_msgs in #print axioms cli_default_block_bounds
+
+/-- info: 'VSync.Spec.wire_roundtrip' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in #print axioms wire_roundtrip
+
+/-- info: 'VSync.Spec.wire_signature' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in #print axioms wire_signature
+
+/-- info: 'VSync.Spec.path_safe' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in #print axioms path_safe
+
+/-- info: 'VSync.Spec.path_rejects_parent' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in #print axioms path_rejects_parent
+
+/-- info: 'VSync.Spec.path_rejects_inner_parent' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in #print axioms path_rejects_inner_parent
+
+/-- info: 'VSync.Spec.path_rejects_absolute' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in #print axioms path_rejects_absolute
+
+/-- info: 'VSync.Spec.path_rejects_dot' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in #print axioms path_rejects_dot
+
+/-- info: 'VSync.Spec.path_rejects_empty' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in #print axioms path_rejects_empty
+
+/-- info: 'VSync.Spec.path_accepts_plain' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in #print axioms path_accepts_plain
+
+/-- info: 'VSync.Spec.sync_segments' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in #print axioms sync_segments
+
+/-- info: 'VSync.Spec.receiver_streaming' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in #print axioms receiver_streaming
+
+/-- info: 'VSync.Spec.receiver_checks_segment' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in #print axioms receiver_checks_segment
+
+/-- info: 'VSync.Spec.cli_serve' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in #print axioms cli_serve
+
+/-- info: 'VSync.Spec.cli_push_default' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in #print axioms cli_push_default
+
+/-- info: 'VSync.Spec.skip_only_if_same' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in #print axioms skip_only_if_same
+
+/-- info: 'VSync.Spec.no_skip_when_racy' depends on axioms: [propext] -/
+#guard_msgs in #print axioms no_skip_when_racy
 
 end VSync.Spec

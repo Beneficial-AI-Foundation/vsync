@@ -25,7 +25,7 @@ def sumB : List UInt8 → Nat
 structure Weak where
   a : Nat
   b : Nat
-  deriving DecidableEq, Hashable, Repr
+  deriving DecidableEq, Hashable, Repr, Inhabited
 
 /-- Specification: checksum of a window computed from scratch. -/
 def weak (w : List UInt8) : Weak := ⟨sumA w % M, sumB w % M⟩

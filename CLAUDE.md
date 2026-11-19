@@ -7,7 +7,14 @@
 - `./build-local.sh` compiles `./c/` with the local leanc (plus `native/vsync_io.c` with the system
   `cc`, because leanc's clang has no system headers on macOS) into `build-local/vsync`.
 - A plain `lake build` (lakefile.lean) also works on any machine with a C compiler.
-- `native/vsync_io.c` is the only unverified C: keep it tiny (atomic durable write only).
+- `native/vsync_io.c` is the only unverified C: file-system calls only (atomic writes, confined
+  `openat` walks with O_NOFOLLOW, pread, lstat). No parsing or protocol logic in C — that lives in
+  Lean (`Wire.lean`, `Proto.lean`) with proofs.
+- Protocol messages must go through `msgC` (proven codecs). New message fields: extend `Msg`,
+  `Msg.toRec`/`ofRec`, and keep `Msg.ofRec_toRec` proven.
+- Paths from the peer must pass `safeRel` before reaching any C call.
+- The VeriLib page source is `pages/vsync.md` (`OWNER` is replaced by the account name when posting).
+- Test hostile inputs (see the attack script approach in git history / page) after protocol changes.
 - Runtime code must stay tied to specs: if you add a fast version of a spec function
   (e.g. `weakFast` vs `weak`), prove they are equal and add that as a spec.
 

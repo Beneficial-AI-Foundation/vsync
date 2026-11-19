@@ -62,10 +62,18 @@ theorem flush_bytes (old new : ByteArray) (B s p : Nat) (acc : Array Op) :
 
 /-! ## signature -/
 
+theorem sigData_size (old : ByteArray) (B : Nat) :
+    (sigData old B).blocks.size = numBlocks old B := by
+  simp [sigData]
+
+theorem sigData_get (old : ByteArray) (B k : Nat) (hk : k < numBlocks old B) :
+    (sigData old B).blocks[k]! = blockInfo (block old B k) := by
+  simp [sigData, hk]
+
 theorem strongs_spec {old : ByteArray} {B i : Nat} {d : ByteArray}
     (h : (signature old B).strongs[i]? = some d) :
     i < numBlocks old B ∧ d = strong (block old B i) := by
-  simp [signature] at h
+  simp [signature, Sig.build, sigData, blockInfo] at h
   obtain ⟨j, hj, rfl⟩ := h
   simp [Array.getElem?_range] at hj
   obtain ⟨hi, rfl⟩ := hj
@@ -260,34 +268,33 @@ theorem pick_complete {sig : Sig} {confirm} {win d : ByteArray} :
       · exact absurd ⟨hs, hc⟩ hne
       · exact pick_complete hk hs hc
 
-theorem index_complete (old : ByteArray) (B : Nat) :
+theorem index_complete (d : SigData) :
     ∀ (L : List Nat) (k : Nat), k ∈ L →
-      ∃ l, (L.foldr (addBlock old B) {})[(⟨weakAt old (k * B) B, strong (block old B k)⟩ : Key)]?
-        = some l ∧ k ∈ l
+      ∃ l, (L.foldr (addBlock d) {})[(⟨d.blocks[k]!.1, d.blocks[k]!.2⟩ : Key)]? = some l ∧ k ∈ l
   | [], _, hk => by simp at hk
   | j :: L, k, hk => by
     simp only [List.foldr_cons, addBlock, Std.HashMap.getElem?_alter]
     by_cases hj : j = k
     · subst hj
       simp only [beq_self_eq_true, ite_true]
-      cases (L.foldr (addBlock old B) {})[(⟨weakAt old (j * B) B, strong (block old B j)⟩ : Key)]?
+      cases (L.foldr (addBlock d) {})[(⟨d.blocks[j]!.1, d.blocks[j]!.2⟩ : Key)]?
         <;> simp [consIdx]
     · have hk' : k ∈ L := by
         rcases List.mem_cons.mp hk with h | h
         · exact absurd h.symm hj
         · exact h
-      obtain ⟨l, hl, hkl⟩ := index_complete old B L k hk'
+      obtain ⟨l, hl, hkl⟩ := index_complete d L k hk'
       split
       · rename_i heq
-        have e : (⟨weakAt old (j * B) B, strong (block old B j)⟩ : Key)
-            = ⟨weakAt old (k * B) B, strong (block old B k)⟩ := by simpa using heq
+        have e : (⟨d.blocks[j]!.1, d.blocks[j]!.2⟩ : Key) = ⟨d.blocks[k]!.1, d.blocks[k]!.2⟩ := by
+          simpa using heq
         rw [e, hl]
         exact ⟨j :: l, by simp [consIdx], by simp [hkl]⟩
       · exact ⟨l, hl, hkl⟩
 
-theorem weaks_complete (old : ByteArray) (B : Nat) :
+theorem weaks_complete (d : SigData) :
     ∀ (L : List Nat) (k : Nat), k ∈ L →
-      (L.foldr (addWeak old B) {}).contains (weakAt old (k * B) B) = true
+      (L.foldr (addWeak d) {}).contains d.blocks[k]!.1 = true
   | [], _, hk => by simp at hk
   | j :: L, k, hk => by
     simp only [List.foldr_cons, addWeak, Std.HashMap.contains_insert]
@@ -297,21 +304,24 @@ theorem weaks_complete (old : ByteArray) (B : Nat) :
         rcases List.mem_cons.mp hk with h | h
         · exact absurd h.symm hj
         · exact h
-      simp [weaks_complete old B L k hk']
+      simp [weaks_complete d L k hk']
 
 theorem findMatch_self (x : ByteArray) (B k : Nat) (hB : 0 < B) (hk : k < x.size / B) :
     (findMatch (signature x B) (confirmLocal x B) (weakAt x (k * B) B) (block x B k)).isSome := by
   have hn : numBlocks x B = x.size / B := numBlocks_pos hB
-  have hmem : k ∈ List.range (numBlocks x B) := by simp [hn, hk]
-  obtain ⟨l, hl, hkl⟩ := index_complete x B _ k hmem
-  have hw := weaks_complete x B _ k hmem
+  have hkn : k < numBlocks x B := hn ▸ hk
+  have hmem : k ∈ List.range (sigData x B).blocks.size := by simp [sigData_size, hkn]
+  have hget := sigData_get x B k hkn
+  obtain ⟨l, hl, hkl⟩ := index_complete (sigData x B) _ k hmem
+  have hw := weaks_complete (sigData x B) _ k hmem
+  rw [hget] at hl hw
   unfold findMatch
-  rw [if_pos (by simpa [signature] using hw)]
+  rw [if_pos (by simpa [signature, Sig.build, blockInfo, weakAt, block] using hw)]
   have hidx : (signature x B).index[(⟨weakAt x (k * B) B, strong (block x B k)⟩ : Key)]? = some l := by
-    simpa [signature] using hl
+    simpa [signature, Sig.build, blockInfo, weakAt, block] using hl
   rw [hidx]
   apply pick_complete hkl
-  · simp [signature, hn, hk]
+  · simp [signature, Sig.build, sigData, blockInfo, hkn]
   · simp [confirmLocal]
 
 theorem go_self (x : ByteArray) (B : Nat) (hB : 0 < (signature x B).B) :

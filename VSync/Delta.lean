@@ -63,21 +63,33 @@ def consIdx (i : Nat) : Option (List Nat) → Option (List Nat)
   | none => some [i]
   | some l => some (i :: l)
 
-def addBlock (old : ByteArray) (B i : Nat) (m : Std.HashMap Key (List Nat)) :
-    Std.HashMap Key (List Nat) :=
-  m.alter ⟨weakAt old (i * B) B, strong (block old B i)⟩ (consIdx i)
+/-- Per-block data sent over the wire: (weak checksum, SHA-256). -/
+def blockInfo (blk : ByteArray) : Weak × ByteArray := (weakFast blk.data.toList, strong blk)
 
-def addWeak (old : ByteArray) (B i : Nat) (m : Std.HashMap Weak Unit) : Std.HashMap Weak Unit :=
-  m.insert (weakAt old (i * B) B) ()
+/-- Everything a sender needs about `old`, as plain data (no hash maps). -/
+structure SigData where
+  B : Nat
+  blocks : Array (Weak × ByteArray)
 
 def numBlocks (old : ByteArray) (B : Nat) : Nat := if B = 0 then 0 else old.size / B
 
-def signature (old : ByteArray) (B : Nat) : Sig :=
-  let n := numBlocks old B
-  { B
-    strongs := (Array.range n).map fun i => strong (block old B i)
-    weaks := (List.range n).foldr (addWeak old B) {}
-    index := (List.range n).foldr (addBlock old B) {} }
+def sigData (old : ByteArray) (B : Nat) : SigData :=
+  { B, blocks := (Array.range (numBlocks old B)).map fun i => blockInfo (block old B i) }
+
+def addBlock (d : SigData) (i : Nat) (m : Std.HashMap Key (List Nat)) : Std.HashMap Key (List Nat) :=
+  m.alter ⟨d.blocks[i]!.1, d.blocks[i]!.2⟩ (consIdx i)
+
+def addWeak (d : SigData) (i : Nat) (m : Std.HashMap Weak Unit) : Std.HashMap Weak Unit :=
+  m.insert d.blocks[i]!.1 ()
+
+/-- Build the lookup structure from plain signature data (sender side). -/
+def Sig.build (d : SigData) : Sig :=
+  { B := d.B
+    strongs := d.blocks.map (·.2)
+    weaks := (List.range d.blocks.size).foldr (addWeak d) {}
+    index := (List.range d.blocks.size).foldr (addBlock d) {} }
+
+def signature (old : ByteArray) (B : Nat) : Sig := Sig.build (sigData old B)
 
 /-! ## Match confirmation -/
 
